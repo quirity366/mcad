@@ -16,6 +16,24 @@ from models.var import VAR
 
 from models.Fast_Fourier_Convolution import RefConv
 
+class SELayer1D(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: (B, L, C)
+        # Squeeze: global average over L
+        y = x.mean(dim=1, keepdim=True)  # (B, 1, C)
+        # Excitation
+        y = self.fc(y)                   # (B, 1, C)
+        # Scale
+        return x * y                     # (B, L, C), broadcast over L
 
 class FP32_Layernorm(nn.LayerNorm):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -34,6 +52,7 @@ class ControlConditionEmbedding(nn.Module):
         super().__init__()
 
         self.conv_in = RefConv(in_channels=conditioning_channels, out_channels=block_out_channels[0], kernel_size=3, padding=1, stride=1)
+        # self.conv_in = nn.Conv2d(conditioning_channels, block_out_channels[0], kernel_size=3, padding=1)
 
         self.blocks = nn.ModuleList([])
 
@@ -42,8 +61,11 @@ class ControlConditionEmbedding(nn.Module):
             channel_out = block_out_channels[i + 1]
             self.blocks.append(RefConv(in_channels=channel_in, out_channels=channel_in, kernel_size=3, padding=1, stride=1))
             self.blocks.append(RefConv(in_channels=channel_in, out_channels=channel_out, kernel_size=3, padding=1, stride=2))
+            # self.blocks.append(nn.Conv2d(channel_in, channel_in, kernel_size=3, padding=1))
+            # self.blocks.append(nn.Conv2d(channel_in, channel_out, kernel_size=3, padding=1, stride=2))
 
         self.conv_out = RefConv(in_channels=block_out_channels[-1], out_channels=conditioning_embedding_channels, kernel_size=3, padding=1, stride=1)
+        # self.conv_out = nn.Conv2d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
 
     def forward(self, conditioning):
         embedding = self.conv_in(conditioning)
@@ -61,7 +83,7 @@ class ControlConditionEmbedding(nn.Module):
 class CAR(VAR):
     def __init__(
             self, vae_local: VQVAE,
-            num_classes=3, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0.,
+            num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0.,
             drop_path_rate=0.,
             norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
             attn_l2_norm=False,
@@ -77,6 +99,7 @@ class CAR(VAR):
         self.car_control_convs = ControlConditionEmbedding(conditioning_embedding_channels=self.C)
 
         self.car_var_conv = RefConv(in_channels=self.C, out_channels=self.C, kernel_size=conv_in_kernel,  padding=conv_in_padding, stride=1)
+        # self.car_var_conv = nn.Conv2d(self.C, self.C, kernel_size=conv_in_kernel, padding=conv_in_padding)
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
@@ -95,11 +118,14 @@ class CAR(VAR):
 
         car_norm_layer = FP32_Layernorm
         car_skip_norm = []
+        car_skip_SELayer = []
         car_skip_linear = []
         for _ in range(depth // 2):
             car_skip_norm.append(car_norm_layer(2 * self.C, elementwise_affine=True, eps=1e-6))
+            car_skip_SELayer.append(SELayer1D(channel=2 * self.C, reduction=16))
             car_skip_linear.append(nn.Linear(2 * self.C, self.C))
         self.car_skip_norm = nn.ModuleList(car_skip_norm)
+        self.car_skip_SELayer = nn.ModuleList(car_skip_SELayer)
         self.car_skip_linear = nn.ModuleList(car_skip_linear)
 
     @torch.no_grad()
@@ -144,18 +170,21 @@ class CAR(VAR):
                 control_f.append(control_i)
 
         if blend:
+            # prepare normal sequence for blending
             normal_gt_idx_Bl: List[torch.LongTensor] = self.vae_proxy[0].img_to_idxBl(good_B3HW)
             normal_gt_BL = torch.cat(normal_gt_idx_Bl, dim=1)
             normal_gt_BLCv_wo_first_l = self.vae_quant_proxy[0].idxBl_to_var_input(normal_gt_idx_Bl)
             normal_gt_BLCv_wo_first_l = torch.cat(normal_gt_BLCv_wo_first_l, dim=1)
             normal_gt_BLC = torch.concat((sos[:B, :].unsqueeze(1), self.word_embed(normal_gt_BLCv_wo_first_l)), dim=1)
 
+            # prepar mask sequence for blending
             mask_gt_BL = self.GetMask4BlendInfer(mask_B3HW=mask_B3HW)
 
 
         for cb in self.car_blocks:
             cb.attn.kv_caching(True)
 
+        # next_control_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1)
         next_control_token_map = sos.unsqueeze(1).expand(sos.shape[0], self.first_l, -1) + self.pos_start.expand(sos.shape[0], self.first_l, -1)
 
         for b in self.blocks:
@@ -163,6 +192,7 @@ class CAR(VAR):
 
         for si, pn in enumerate(self.patch_nums):  # si: i-th segment
             ratio = si / self.num_stages_minus_1
+            # last_L = cur_L
             cur_L += pn * pn
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
@@ -185,6 +215,7 @@ class CAR(VAR):
                     con_f = control_residual_f.pop()
                     cat = torch.cat([x, con_f], dim=-1)
                     cat = self.car_skip_norm[bidx - len(self.blocks) // 2](cat)
+                    cat = self.car_skip_SELayer[bidx - len(self.blocks) // 2](cat)
                     x = self.car_skip_linear[bidx - len(self.blocks) // 2](cat)
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
 
@@ -225,11 +256,16 @@ class CAR(VAR):
             cb.attn.kv_caching(False)
 
         if blend:
+            # 在这里加上f_hat上做teaching-force
+            # 先求normal图的特征f
             f_normal_ = self.vae_proxy[0].quant_conv(self.vae_proxy[0].encoder(good_B3HW))
+            # 再把mask缩放到指定尺寸
             mask_sizef = self.GetMask4fhatInfer(mask_B3HW=mask_B3HW)
             del mask_B3HW
+            # 再把f_normal和f_hat相加
             aug = 1
             f_hat = f_hat * mask_sizef * aug + f_normal_ * (1 - mask_sizef)
+            # f_hat = f_normal_
 
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
 
@@ -239,6 +275,7 @@ class CAR(VAR):
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l[0].shape[0]
         with torch.cuda.amp.autocast(enabled=False):
+            # label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
             sos = cond_BD = self.class_emb(label_B)
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
 
@@ -292,6 +329,7 @@ class CAR(VAR):
                 con_f = control_residual_f.pop()
                 cat = torch.cat([x_BLC, con_f], dim=-1)
                 cat = self.car_skip_norm[i - len(self.blocks) // 2](cat)
+                cat = self.car_skip_SELayer[i - len(self.blocks) // 2](cat)
                 x_BLC = self.car_skip_linear[i - len(self.blocks) // 2](cat)
             x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
 
@@ -299,41 +337,59 @@ class CAR(VAR):
 
         return x_BLC  # logits BLV, V is vocab_size
 
+    # ================================================================================
+    # define some util functions for blending
+    # ================================================================================
 
     def GetMask4BlendInfer(self, mask_B3HW: torch.Tensor):
+        # 1. 将图像从3通道转换为1通道
         mask_B3HW = mask_B3HW.mean(dim=1, keepdim=True)  # 形状为 (B, 1, H, W)
 
+        # 2. 将灰度值转换到[0, 1]范围
         mask_B3HW = torch.clamp(mask_B3HW, 0, 1)
 
+        # 3. 定义插值的目标边长
         target_sizes = self.patch_nums
 
+        # 4. 对图像进行插值并展平拼接
         flattened_tensors = []
         for size in target_sizes:
+            # 插值
             interpolated_tensor = F.interpolate(mask_B3HW, size=(size, size), mode='area')
+            # 展平
             flattened_tensor = interpolated_tensor.view(mask_B3HW.size(0), -1)
+            # 拼接
             flattened_tensors.append(flattened_tensor)
 
+        # 将所有展平后的张量拼接成一个形状为 (B, 680) 的向量
         output_tensor = torch.cat(flattened_tensors, dim=1)
 
+        # 将 output_tensor 中不等于 0 的部分变成 1
         mask_weak_L = 0
         for patch_num in self.patch_nums:
             if patch_num < self.patch_nums[6]:
                 mask_weak_L += patch_num
         output_tensor = torch.cat((output_tensor[:, :mask_weak_L], torch.where(output_tensor[:, mask_weak_L:] != 0, torch.tensor(1.0), output_tensor[:, mask_weak_L:])), dim=1)
 
+        # 输出: torch.Size([8, 680])
         return output_tensor
 
     def GetMask4fhatInfer(self, mask_B3HW: torch.Tensor):
         interpolated_tensor = mask_B3HW
+        # 1. 将图像从3通道转换为1通道
         interpolated_tensor = interpolated_tensor.mean(dim=1, keepdim=True)  # 形状为 (B, 1, H, W)
 
+        # 2. 将灰度值转换到[0, 1]范围
         interpolated_tensor = torch.clamp(interpolated_tensor, 0, 1)
 
+        # 3. 定义插值的目标边长
         target_size = self.patch_nums[-1]
 
+        # 4. 进行插值
         interpolated_tensor = F.interpolate(interpolated_tensor, size=(target_size, target_size), mode='area')
 
-        threshold = 0.2  
+        # 5. 将大于阈值的值变成1
+        threshold = 0.2  # 设置阈值
         interpolated_tensor = torch.where(interpolated_tensor > threshold,
                                           torch.ones_like(interpolated_tensor),
                                           torch.zeros_like(interpolated_tensor))
